@@ -99,6 +99,17 @@ public interface SinkBehaviorConfig {
   String documentId();
 
   /**
+   * Dynamic location by key values.  Format is "<bucket>.<scope>.<collection>"
+   * Key is assumed to be json and and referenced via key fields via placeholders
+   * like ${/client}.${/scope}.${recordtype}
+   *
+   * If bucket is left off the default connection bucket will be used.
+   * <scope>.<collection>
+   */
+  @Default
+  String locationId();
+
+  /**
    * Whether to remove the ID identified by 'couchbase.documentId' from the document before storing in Couchbase.
    */
   @Default("false")

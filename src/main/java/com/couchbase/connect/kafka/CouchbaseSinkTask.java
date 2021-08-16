@@ -20,20 +20,8 @@ import com.couchbase.client.core.logging.LogRedaction;
 import com.couchbase.client.java.Collection;
 import com.couchbase.connect.kafka.config.sink.CouchbaseSinkConfig;
 import com.couchbase.connect.kafka.config.sink.SinkBehaviorConfig.DocumentMode;
-import com.couchbase.connect.kafka.handler.sink.N1qlSinkHandler;
-import com.couchbase.connect.kafka.handler.sink.SinkAction;
-import com.couchbase.connect.kafka.handler.sink.SinkDocument;
-import com.couchbase.connect.kafka.handler.sink.SinkHandler;
-import com.couchbase.connect.kafka.handler.sink.SinkHandlerContext;
-import com.couchbase.connect.kafka.handler.sink.SinkHandlerParams;
-import com.couchbase.connect.kafka.handler.sink.SubDocumentSinkHandler;
-import com.couchbase.connect.kafka.util.BatchBuilder;
-import com.couchbase.connect.kafka.util.DocumentIdExtractor;
-import com.couchbase.connect.kafka.util.DocumentPathExtractor;
-import com.couchbase.connect.kafka.util.DurabilitySetter;
-import com.couchbase.connect.kafka.util.ScopeAndCollection;
-import com.couchbase.connect.kafka.util.TopicMap;
-import com.couchbase.connect.kafka.util.Version;
+import com.couchbase.connect.kafka.handler.sink.*;
+import com.couchbase.connect.kafka.util.*;
 import com.couchbase.connect.kafka.util.config.ConfigHelper;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
@@ -50,11 +38,7 @@ import reactor.core.publisher.Mono;
 
 import java.io.IOException;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 import java.util.stream.Stream;
 
 import static com.couchbase.client.core.util.CbCollections.mapOf;
@@ -63,176 +47,193 @@ import static com.couchbase.client.core.util.CbStrings.removeStart;
 import static java.util.Collections.unmodifiableMap;
 
 public class CouchbaseSinkTask extends SinkTask {
-  private static final Logger LOGGER = LoggerFactory.getLogger(CouchbaseSinkTask.class);
+    private static final Logger LOGGER = LoggerFactory.getLogger(CouchbaseSinkTask.class);
 
-  private ScopeAndCollection defaultDestCollection;
-  private Map<String, ScopeAndCollection> topicToCollection;
-  private KafkaCouchbaseClient client;
-  private JsonConverter converter;
-  private DocumentIdExtractor documentIdExtractor;
-  private SinkHandler sinkHandler;
+    private ScopeAndCollection defaultDestCollection;
+    private Map<String, ScopeAndCollection> topicToCollection;
+    private KafkaCouchbaseClient client;
+    private JsonConverter converter;
+    private DocumentIdExtractor documentIdExtractor;
+    private SinkHandler sinkHandler;
+    private LocationExtractor locationExtractor;
 
-  private DurabilitySetter durabilitySetter;
+    private DurabilitySetter durabilitySetter;
 
-  @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
-  private Optional<Duration> documentExpiry;
+    @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
+    private Optional<Duration> documentExpiry;
 
-  @Override
-  public String version() {
-    return Version.getVersion();
-  }
-
-  @Override
-  public void start(Map<String, String> properties) {
-    CouchbaseSinkConfig config;
-    try {
-      config = ConfigHelper.parse(CouchbaseSinkConfig.class, properties);
-    } catch (ConfigException e) {
-      throw new ConnectException("Couldn't start CouchbaseSinkTask due to configuration error", e);
+    @Override
+    public String version() {
+        return Version.getVersion();
     }
 
-    Map<String, String> clusterEnvProperties = new HashMap<>();
-    properties.forEach((key, value) -> {
-      if (key.startsWith("couchbase.env.") && !isNullOrEmpty(value)) {
-        clusterEnvProperties.put(removeStart(key, "couchbase.env."), value);
-      }
-    });
+    @Override
+    public void start(Map<String, String> properties) {
+        CouchbaseSinkConfig config;
+        try {
+            config = ConfigHelper.parse(CouchbaseSinkConfig.class, properties);
+        } catch (ConfigException e) {
+            throw new ConnectException("Couldn't start CouchbaseSinkTask due to configuration error", e);
+        }
 
-    LOGGER.info("Custom ClusterEnvironment properties: {}", clusterEnvProperties);
+        Map<String, String> clusterEnvProperties = new HashMap<>();
+        properties.forEach((key, value) -> {
+            if (key.startsWith("couchbase.env.") && !isNullOrEmpty(value)) {
+                clusterEnvProperties.put(removeStart(key, "couchbase.env."), value);
+            }
+        });
 
-    LogRedaction.setRedactionLevel(config.logRedaction());
-    client = new KafkaCouchbaseClient(config, clusterEnvProperties);
-    defaultDestCollection = ScopeAndCollection.parse(config.defaultCollection());
-    topicToCollection = TopicMap.parse(config.topicToCollection());
+        LOGGER.info("Custom ClusterEnvironment properties: {}", clusterEnvProperties);
 
-    converter = new JsonConverter();
-    converter.configure(mapOf("schemas.enable", false), false);
+        LogRedaction.setRedactionLevel(config.logRedaction());
+        client = new KafkaCouchbaseClient(config, clusterEnvProperties);
+        defaultDestCollection = ScopeAndCollection.parse(config.defaultCollection());
+        topicToCollection = TopicMap.parse(config.topicToCollection());
 
-    String docIdPointer = config.documentId();
-    if (docIdPointer != null && !docIdPointer.isEmpty()) {
-      documentIdExtractor = new DocumentIdExtractor(docIdPointer, config.removeDocumentId());
+        converter = new JsonConverter();
+        converter.configure(mapOf("schemas.enable", false), false);
+
+        String docIdPointer = config.documentId();
+        if (docIdPointer != null && !docIdPointer.isEmpty()) {
+            documentIdExtractor = new DocumentIdExtractor(docIdPointer, config.removeDocumentId());
+        }
+
+        String locationPointer = config.locationId();
+        if (locationPointer != null && !locationPointer.isEmpty()) {
+            locationExtractor = new LocationExtractor(locationPointer);
+        }
+
+        Class<? extends SinkHandler> sinkHandlerClass = config.sinkHandler();
+
+        DocumentMode documentMode = config.documentMode();
+        if (documentMode != DocumentMode.DOCUMENT) {
+            sinkHandlerClass = documentMode == DocumentMode.N1QL
+                    ? N1qlSinkHandler.class
+                    : SubDocumentSinkHandler.class;
+            LOGGER.warn("Forcing sink handler to {} because document mode is {}." +
+                            " The `couchbase.document.mode` config property is deprecated;" +
+                            " please use `couchbase.sink.handler` instead.",
+                    sinkHandlerClass, documentMode);
+        }
+
+        sinkHandler = Utils.newInstance(sinkHandlerClass);
+        sinkHandler.init(new SinkHandlerContext(client.cluster().reactive(), unmodifiableMap(properties)));
+
+        LOGGER.info("Using sink handler: {}", sinkHandler);
+
+        durabilitySetter = DurabilitySetter.create(config);
+        documentExpiry = config.documentExpiration().isZero()
+                ? Optional.empty()
+                : Optional.of(config.documentExpiration());
     }
 
-    Class<? extends SinkHandler> sinkHandlerClass = config.sinkHandler();
+    @Override
+    public void put(java.util.Collection<SinkRecord> records) {
+        if (records.isEmpty()) {
+            return;
+        }
+        final SinkRecord first = records.iterator().next();
+        final int recordsCount = records.size();
+        LOGGER.trace("Received {} records. First record kafka coordinates:({}-{}-{}). Writing them to the Couchbase...",
+                recordsCount, first.topic(), first.kafkaPartition(), first.kafkaOffset());
 
-    DocumentMode documentMode = config.documentMode();
-    if (documentMode != DocumentMode.DOCUMENT) {
-      sinkHandlerClass = documentMode == DocumentMode.N1QL
-          ? N1qlSinkHandler.class
-          : SubDocumentSinkHandler.class;
-      LOGGER.warn("Forcing sink handler to {} because document mode is {}." +
-              " The `couchbase.document.mode` config property is deprecated;" +
-              " please use `couchbase.sink.handler` instead.",
-          sinkHandlerClass, documentMode);
+        List<SinkAction> actions = new ArrayList<>(records.size());
+        for (SinkRecord record : records) {
+            ScopeAndCollection destCollectionSpec = topicToCollection.getOrDefault(record.topic(), defaultDestCollection);
+            Collection destCollection;
+
+            if (locationExtractor == null) {
+                destCollection = client.collection(destCollectionSpec);
+            } else {
+                byte[] keyJson = converter.fromConnectData(record.topic(),record.keySchema(),record.key());
+                try {
+                    destCollection = client.collection(locationExtractor.getBucket(keyJson), locationExtractor.getScope(keyJson), locationExtractor.getCollection(keyJson));
+                } catch (Exception e) {
+                    destCollection = client.collection(destCollectionSpec);
+                }
+            }
+
+            SinkAction action = sinkHandler.handle(
+                    new SinkHandlerParams(
+                            client.cluster().reactive(),
+                            destCollection.reactive(),
+                            record,
+                            toSinkDocument(record),
+                            documentExpiry,
+                            durabilitySetter));
+
+            if (action != null) {
+                actions.add(action);
+            }
+        }
+
+        execute(actions);
     }
 
-    sinkHandler = Utils.newInstance(sinkHandlerClass);
-    sinkHandler.init(new SinkHandlerContext(client.cluster().reactive(), unmodifiableMap(properties)));
+    private static void execute(List<SinkAction> actions) {
+        // The Kafka consumer session will probably expire long before this.
+        // This is just a failsafe so we don't end up waiting for Godot.
+        Duration timeout = Duration.ofMinutes(10);
 
-    LOGGER.info("Using sink handler: {}", sinkHandler);
-
-    durabilitySetter = DurabilitySetter.create(config);
-    documentExpiry = config.documentExpiration().isZero()
-        ? Optional.empty()
-        : Optional.of(config.documentExpiration());
-  }
-
-  @Override
-  public void put(java.util.Collection<SinkRecord> records) {
-    if (records.isEmpty()) {
-      return;
-    }
-    final SinkRecord first = records.iterator().next();
-    final int recordsCount = records.size();
-    LOGGER.trace("Received {} records. First record kafka coordinates:({}-{}-{}). Writing them to the Couchbase...",
-        recordsCount, first.topic(), first.kafkaPartition(), first.kafkaOffset());
-
-    List<SinkAction> actions = new ArrayList<>(records.size());
-    for (SinkRecord record : records) {
-      ScopeAndCollection destCollectionSpec = topicToCollection.getOrDefault(record.topic(), defaultDestCollection);
-      Collection destCollection = client.collection(destCollectionSpec);
-
-      SinkAction action = sinkHandler.handle(
-          new SinkHandlerParams(
-              client.cluster().reactive(),
-              destCollection.reactive(),
-              record,
-              toSinkDocument(record),
-              documentExpiry,
-              durabilitySetter));
-
-      if (action != null) {
-        actions.add(action);
-      }
+        toMono(actions).block(timeout);
     }
 
-    execute(actions);
-  }
+    // visible for testing
+    static Mono<Void> toMono(List<SinkAction> actions) {
+        // Use concurrency hints to group the actions into batches
+        BatchBuilder<Mono<Void>> batchBuilder = new BatchBuilder<>();
+        for (SinkAction action : actions) {
+            batchBuilder.add(action.action(), action.concurrencyHint());
+        }
 
-  private static void execute(List<SinkAction> actions) {
-    // The Kafka consumer session will probably expire long before this.
-    // This is just a failsafe so we don't end up waiting for Godot.
-    Duration timeout = Duration.ofMinutes(10);
+        // Transform each batch of actions into a Flux that runs the actions
+        // in the batch concurrently (up to the default flatMap concurrency limit).
+        Stream<Mono<Void>> batches = batchBuilder.build().stream()
+                .map(batch -> Flux.fromIterable(batch)
+                        .flatMap(it -> it)
+                        .then()); // Just for clarity, convert the Flux<Void> into a Mono<Void>.
 
-    toMono(actions).block(timeout);
-  }
-
-  // visible for testing
-  static Mono<Void> toMono(List<SinkAction> actions) {
-    // Use concurrency hints to group the actions into batches
-    BatchBuilder<Mono<Void>> batchBuilder = new BatchBuilder<>();
-    for (SinkAction action : actions) {
-      batchBuilder.add(action.action(), action.concurrencyHint());
+        // Now we have a stream of Mono<Void>s where each mono represents a batch.
+        // Concatenate them so we end up waiting for each batch to complete
+        // before starting the next one.
+        return Flux.fromStream(batches)
+                .concatMap(it -> it)
+                .then(); // We only care about the final completion signal.
     }
 
-    // Transform each batch of actions into a Flux that runs the actions
-    // in the batch concurrently (up to the default flatMap concurrency limit).
-    Stream<Mono<Void>> batches = batchBuilder.build().stream()
-        .map(batch -> Flux.fromIterable(batch)
-            .flatMap(it -> it)
-            .then()); // Just for clarity, convert the Flux<Void> into a Mono<Void>.
+    /**
+     * @return (nullable)
+     */
+    private SinkDocument toSinkDocument(SinkRecord record) {
+        if (record.value() == null) {
+            return null;
+        }
 
-    // Now we have a stream of Mono<Void>s where each mono represents a batch.
-    // Concatenate them so we end up waiting for each batch to complete
-    // before starting the next one.
-    return Flux.fromStream(batches)
-        .concatMap(it -> it)
-        .then(); // We only care about the final completion signal.
-  }
+        byte[] valueAsJsonBytes = converter.fromConnectData(record.topic(), record.valueSchema(), record.value());
+        try {
+            if (documentIdExtractor != null) {
+                return documentIdExtractor.extractDocumentId(valueAsJsonBytes);
+            }
 
-  /**
-   * @return (nullable)
-   */
-  private SinkDocument toSinkDocument(SinkRecord record) {
-    if (record.value() == null) {
-      return null;
+        } catch (DocumentPathExtractor.DocumentPathNotFoundException e) {
+            LOGGER.warn(e.getMessage() + "; letting sink handler use fallback ID");
+
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+
+        return new SinkDocument(null, valueAsJsonBytes);
     }
 
-    byte[] valueAsJsonBytes = converter.fromConnectData(record.topic(), record.valueSchema(), record.value());
-    try {
-      if (documentIdExtractor != null) {
-        return documentIdExtractor.extractDocumentId(valueAsJsonBytes);
-      }
-
-    } catch (DocumentPathExtractor.DocumentPathNotFoundException e) {
-      LOGGER.warn(e.getMessage() + "; letting sink handler use fallback ID");
-
-    } catch (IOException e) {
-      throw new RuntimeException(e);
+    @Override
+    public void flush(Map<TopicPartition, OffsetAndMetadata> offsets) {
     }
 
-    return new SinkDocument(null, valueAsJsonBytes);
-  }
-
-  @Override
-  public void flush(Map<TopicPartition, OffsetAndMetadata> offsets) {
-  }
-
-  @Override
-  public void stop() {
-    if (client != null) {
-      client.close();
-      client = null;
+    @Override
+    public void stop() {
+        if (client != null) {
+            client.close();
+            client = null;
+        }
     }
-  }
 }
