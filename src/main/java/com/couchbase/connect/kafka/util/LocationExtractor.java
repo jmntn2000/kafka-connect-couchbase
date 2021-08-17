@@ -15,7 +15,7 @@ public class LocationExtractor {
         String[] parts = locationString.split(Pattern.quote("."));
 
         int i=0;
-        if(parts.length!=3){
+        if(parts.length==3){
             useDefaultBucket=false;
             bucketExtractor = new DocumentPathExtractor(parts[i++],false);
         }else{

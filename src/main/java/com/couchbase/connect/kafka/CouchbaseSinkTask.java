@@ -147,8 +147,13 @@ public class CouchbaseSinkTask extends SinkTask {
             } else {
                 byte[] keyJson = converter.fromConnectData(record.topic(),record.keySchema(),record.key());
                 try {
-                    destCollection = client.collection(locationExtractor.getBucket(keyJson), locationExtractor.getScope(keyJson), locationExtractor.getCollection(keyJson));
+                    String bucket = locationExtractor.getBucket(keyJson);
+                    String scope = locationExtractor.getScope(keyJson);
+                    String collection = locationExtractor.getCollection(keyJson);
+                    LOGGER.info("Sending document to "+bucket+":"+scope+":"+collection);
+                    destCollection = client.collection(bucket, scope, collection);
                 } catch (Exception e) {
+                    LOGGER.error("Error setting up location: "+e.getMessage());
                     destCollection = client.collection(destCollectionSpec);
                 }
             }
